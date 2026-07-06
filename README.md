@@ -2,54 +2,69 @@
 
 ## Overview
 
-This repository contains a warehouse stock navigation project built around camera-based QR code detection and a live web dashboard. The main Python script `Camer_detection_&_webpage.py` captures video from a camera, detects QR codes, parses product and location data, and streams detection results through a Flask web interface.
+This repository runs a camera-based QR code detection system with a live Flask dashboard. The primary updated script is `Camera_detection_map_webpage_V2.py`, which adds a map view, MJPEG video streaming for the camera feed, rack action buttons (placeholder for SSH execution), and improved logging and save routines.
 
-## What the code does
+## Features (in `Camera_detection_map_webpage_V2.py`)
 
-- Uses OpenCV to access a camera stream and detect QR codes in each frame.
-- Parses QR data into a category ID, product serial number, and location ID.
-- Maps detected IDs to human-readable product names and shelf locations.
-- Flags mismatches when products are placed in the wrong location.
-- Displays detected items and logs on a live webpage served by Flask.
-- Auto-refreshes the dashboard every second to show the latest detections.
+- Flask web dashboard at `http://0.0.0.0:5000` with endpoints for data, logs, video feed, map image, and rack actions.
+- MJPEG streaming endpoint: `/video_feed/<camera_id>` (used by the dashboard to show live camera frames).
+- Map image route: `/map_image` serving the image at `MAP_IMAGE_PATH` (edit path in the script if needed).
+- Rack button route: `/rack/<rack_name>` (currently logs the press; SSH/remote execution can be added later).
+- Auto-refreshing dashboard (1s) showing detected QR items and the last ~50 log entries.
+- Saves detection snapshots to `Stock/` and logs to `Logs/Resolved` and `Logs/Unresolved` on shutdown or when requested.
 
-## Main script
+## Key files
 
-- `Camer_detection_&_webpage.py`
-  - Starts a Flask server at `http://0.0.0.0:5000`.
-  - Runs a QR code detector in a camera loop.
-  - Draws bounding boxes around detected QR codes.
-  - Stores detected data and logs for display on the dashboard.
-
-## Log folders
-
-- `Logs/Resolved/` — contains resolved detection logs.
-- `Logs/Unresolved/` — contains unresolved or error logs.
-- `Stock/` — contains inventory or stock log records.
+- `Camera_detection_map_webpage_V2.py` — main updated detector + dashboard.
+- `map.jpg` (or any image) — referenced by `MAP_IMAGE_PATH` inside the Python script; ensure it exists and the path is correct.
+- `Logs/` — log output folders (Resolved and Unresolved).
+- `Stock/` — saved detection snapshots.
 
 ## Requirements
 
-- Python 3.x
+- Python 3.8+
 - OpenCV (`opencv-python`)
 - Flask
 - NumPy
 
-## Run the project
+Install dependencies:
 
-1. Install dependencies:
-   ```bash
-   pip install opencv-python flask numpy
-   ```
-2. Run the script:
-   ```bash
-   python "Camer_detection_&_webpage.py"
-   ```
-3. Open your browser and go to:
-   ```
-   http://localhost:5000
-   ```
+```bash
+pip install opencv-python flask numpy
+```
 
-## Notes
+## Configuration
 
-- The script uses example category and location mappings. Update the dictionaries in `Camer_detection_&_webpage.py` if your QR codes use a different format.
-- Press `q` to stop the camera detection loop.
+- Edit `MAP_IMAGE_PATH` in `Camera_detection_map_webpage_V2.py` to point to your map image (default is set near the top of the file).
+- Make sure your camera device index (0 by default) is correct.
+
+## Run
+
+Start the script:
+
+```bash
+python Camera_detection_map_webpage_V2.py
+```
+
+Open the dashboard:
+
+```
+http://localhost:5000
+```
+
+Stop the program with Ctrl+C in the terminal or press `q` in the camera window.
+
+## Endpoints reference
+
+- `/` — Dashboard HTML
+- `/data` — JSON list of detected items
+- `/logs` — JSON list of log entries
+- `/video_feed/<camera_id>` — MJPEG stream for camera preview
+- `/map_image` — Map image file (served from `MAP_IMAGE_PATH`)
+- `/rack/<rack_name>` — Rack action endpoint (placeholder)
+
+## Notes & Next steps
+
+- The `/rack` endpoint is a stub for now; add SSH execution to trigger remote actions from the dashboard.
+- Update the category/location dictionaries inside the script to match your QR encoding scheme.
+- If you want, I can commit these README changes and push them to the GitHub remote from this machine — confirm and ensure your git credentials are configured locally.
