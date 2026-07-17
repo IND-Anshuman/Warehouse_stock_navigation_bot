@@ -1,0 +1,377 @@
+version: "3.9"
+
+# ============================================================
+#  Autonomous Warehouse Inventory Audit Platform
+#  Local Development Docker Compose Stack
+# ============================================================
+
+networks:
+  warehouse-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  kafka_data:
+  zookeeper_data:
+  prometheus_data:
+  grafana_data:
+
+services:
+
+  # ─────────────────────────────────────────────
+  # INFRASTRUCTURE LAYER
+  # ─────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: wh-postgres
+    environment:
+      POSTGRES_USER: warehouse_admin
+      POSTGRES_PASSWORD: warehouse_secret
+      POSTGRES_DB: warehouse_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/00_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U warehouse_admin -d warehouse_platform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - warehouse-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: wh-redis
+    command: redis-server --requirepass redis_secret --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis_secret", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - warehouse-net
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: wh-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper
+    networks:
+      - warehouse-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: wh-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - warehouse-net
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: wh-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      echo 'Waiting for Kafka...'
+      sleep 15
+      echo 'Creating Kafka topics...'
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 12 --replication-factor 1 --topic robot.telemetry.heartbeat
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 6  --replication-factor 1 --topic mission.lifecycle
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 24 --replication-factor 1 --topic observation.raw
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 12 --replication-factor 1 --topic inventory.reconciliation.mismatch
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 12 --replication-factor 1 --topic inventory.reconciliation.verified
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 6  --replication-factor 1 --topic alert.lifecycle
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 6  --replication-factor 1 --topic observation.raw.dlq
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --partitions 6  --replication-factor 1 --topic digital.twin.updates
+      echo 'Kafka topics created successfully!'
+      "
+    networks:
+      - warehouse-net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: wh-kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    networks:
+      - warehouse-net
+
+  minio:
+    image: minio/minio:latest
+    container_name: wh-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio_admin
+      MINIO_ROOT_PASSWORD: minio_secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - warehouse-net
+
+  # ─────────────────────────────────────────────
+  # APPLICATION SERVICES
+  # ─────────────────────────────────────────────
+
+  topology-service:
+    build:
+      context: ./services/topology-service
+      dockerfile: Dockerfile
+    container_name: wh-topology-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://warehouse_admin:warehouse_secret@postgres:5432/warehouse_platform
+      REDIS_URL: redis://:redis_secret@redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SERVICE_NAME: topology-service
+      LOG_LEVEL: INFO
+      PORT: 8001
+    ports:
+      - "8001:8001"
+    networks:
+      - warehouse-net
+    restart: unless-stopped
+
+  mission-service:
+    build:
+      context: ./services/mission-service
+      dockerfile: Dockerfile
+    container_name: wh-mission-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://warehouse_admin:warehouse_secret@postgres:5432/warehouse_platform
+      REDIS_URL: redis://:redis_secret@redis:6379/1
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TOPOLOGY_SERVICE_URL: http://topology-service:8001
+      SERVICE_NAME: mission-service
+      LOG_LEVEL: INFO
+      PORT: 8002
+    ports:
+      - "8002:8002"
+    networks:
+      - warehouse-net
+    restart: unless-stopped
+
+  observation-service:
+    build:
+      context: ./services/observation-service
+      dockerfile: Dockerfile
+    container_name: wh-observation-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://warehouse_admin:warehouse_secret@postgres:5432/warehouse_platform
+      REDIS_URL: redis://:redis_secret@redis:6379/2
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minio_admin
+      MINIO_SECRET_KEY: minio_secret
+      MINIO_BUCKET: warehouse-frames
+      TOPOLOGY_SERVICE_URL: http://topology-service:8001
+      SERVICE_NAME: observation-service
+      LOG_LEVEL: INFO
+      PORT: 8003
+    ports:
+      - "8003:8003"
+    networks:
+      - warehouse-net
+    restart: unless-stopped
+
+  reconciliation-service:
+    build:
+      context: ./services/reconciliation-service
+      dockerfile: Dockerfile
+    container_name: wh-reconciliation-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://warehouse_admin:warehouse_secret@postgres:5432/warehouse_platform
+      REDIS_URL: redis://:redis_secret@redis:6379/3
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TOPOLOGY_SERVICE_URL: http://topology-service:8001
+      SERVICE_NAME: reconciliation-service
+      LOG_LEVEL: INFO
+      PORT: 8004
+    ports:
+      - "8004:8004"
+    networks:
+      - warehouse-net
+    restart: unless-stopped
+
+  alerting-service:
+    build:
+      context: ./services/alerting-service
+      dockerfile: Dockerfile
+    container_name: wh-alerting-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://warehouse_admin:warehouse_secret@postgres:5432/warehouse_platform
+      REDIS_URL: redis://:redis_secret@redis:6379/4
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SERVICE_NAME: alerting-service
+      LOG_LEVEL: INFO
+      PORT: 8005
+    ports:
+      - "8005:8005"
+    networks:
+      - warehouse-net
+    restart: unless-stopped
+
+  digital-twin-sync:
+    build:
+      context: ./services/digital-twin-sync
+      dockerfile: Dockerfile
+    container_name: wh-digital-twin-sync
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://:redis_secret@redis:6379/5
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TOPOLOGY_SERVICE_URL: http://topology-service:8001
+      SERVICE_NAME: digital-twin-sync
+      LOG_LEVEL: INFO
+      PORT: 8006
+    ports:
+      - "8006:8006"
+    networks:
+      - warehouse-net
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # OBSERVABILITY
+  # ─────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: wh-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    networks:
+      - warehouse-net
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: wh-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: grafana_secret
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus
+    networks:
+      - warehouse-net
+
+  # ─────────────────────────────────────────────
+  # ROBOT SIMULATOR (dev tool)
+  # ─────────────────────────────────────────────
+
+  robot-simulator:
+    build:
+      context: ./apps/robot-simulator
+      dockerfile: Dockerfile
+    container_name: wh-robot-simulator
+    depends_on:
+      - observation-service
+      - mission-service
+    environment:
+      OBSERVATION_SERVICE_URL: http://observation-service:8003
+      MISSION_SERVICE_URL: http://mission-service:8002
+      TOPOLOGY_SERVICE_URL: http://topology-service:8001
+      ROBOT_COUNT: 3
+      WAREHOUSE_ID: warehouse-001
+      LOG_LEVEL: INFO
+    networks:
+      - warehouse-net
+    restart: unless-stopped
