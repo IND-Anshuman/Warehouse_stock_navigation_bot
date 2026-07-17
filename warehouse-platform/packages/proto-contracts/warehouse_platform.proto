@@ -1,0 +1,238 @@
+syntax = "proto3";
+
+package platform.events;
+
+option java_multiple_files = true;
+option java_package = "com.warehouse.platform.events";
+
+import "google/protobuf/timestamp.proto";
+
+// ─────────────────────────────────────────────────────────
+//  COMMON
+// ─────────────────────────────────────────────────────────
+
+message EventEnvelope {
+  string event_id = 1;
+  string event_type = 2;
+  string source_service = 3;
+  google.protobuf.Timestamp produced_at = 4;
+  bytes payload = 5;  // JSON-encoded domain payload
+  string schema_version = 6;
+}
+
+message Position3D {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  double yaw = 4;  // heading in radians
+}
+
+// ─────────────────────────────────────────────────────────
+//  ROBOT TELEMETRY EVENTS
+// ─────────────────────────────────────────────────────────
+
+enum RobotStatus {
+  ROBOT_STATUS_UNSPECIFIED = 0;
+  ROBOT_STATUS_IDLE = 1;
+  ROBOT_STATUS_AUDITING = 2;
+  ROBOT_STATUS_CHARGING = 3;
+  ROBOT_STATUS_FAULTED = 4;
+  ROBOT_STATUS_OFFLINE = 5;
+  ROBOT_STATUS_MAINTENANCE = 6;
+}
+
+message RobotHeartbeat {
+  string robot_id = 1;
+  string warehouse_id = 2;
+  google.protobuf.Timestamp timestamp = 3;
+  double battery_percentage = 4;
+  Position3D position = 5;
+  string active_mission_id = 6;
+  RobotStatus status = 7;
+  int32 seq_no = 8;
+  float wifi_rssi_dbm = 9;
+  int32 offline_buffer_size = 10;  // number of queued observations
+}
+
+// ─────────────────────────────────────────────────────────
+//  MISSION EVENTS
+// ─────────────────────────────────────────────────────────
+
+enum MissionStatus {
+  MISSION_STATUS_UNSPECIFIED = 0;
+  MISSION_STATUS_SCHEDULED = 1;
+  MISSION_STATUS_IN_PROGRESS = 2;
+  MISSION_STATUS_COMPLETED = 3;
+  MISSION_STATUS_FAILED = 4;
+  MISSION_STATUS_CANCELLED = 5;
+  MISSION_STATUS_PAUSED = 6;
+}
+
+message MissionStarted {
+  string mission_id = 1;
+  string warehouse_id = 2;
+  string robot_id = 3;
+  google.protobuf.Timestamp started_at = 4;
+  repeated string zone_ids = 5;
+  int32 total_bins_target = 6;
+}
+
+message MissionCompleted {
+  string mission_id = 1;
+  string warehouse_id = 2;
+  string robot_id = 3;
+  google.protobuf.Timestamp completed_at = 4;
+  int32 total_bins_scanned = 5;
+  float coverage_pct = 6;
+  int32 total_mismatches_found = 7;
+  int32 total_verified = 8;
+}
+
+message MissionFailed {
+  string mission_id = 1;
+  string warehouse_id = 2;
+  string robot_id = 3;
+  google.protobuf.Timestamp failed_at = 4;
+  string failure_reason = 5;
+  int32 bins_scanned_before_failure = 6;
+}
+
+// ─────────────────────────────────────────────────────────
+//  OBSERVATION EVENTS
+// ─────────────────────────────────────────────────────────
+
+message ObservationCreated {
+  string observation_id = 1;
+  string mission_id = 2;
+  string robot_id = 3;
+  string warehouse_id = 4;
+  google.protobuf.Timestamp observed_at = 5;
+
+  string bin_id = 6;
+  string bin_code = 7;
+  string decoded_qr = 8;
+  float detection_confidence = 9;
+  float blur_score = 10;
+
+  string image_url = 11;
+  Position3D robot_position = 12;
+}
+
+message ObservationProcessingFailed {
+  string observation_id = 1;
+  string robot_id = 2;
+  string bin_code = 3;
+  string error_reason = 4;  // DECODE_FAILED, BLUR_REJECTED, SPATIAL_RESOLUTION_FAILED
+  google.protobuf.Timestamp failed_at = 5;
+}
+
+// ─────────────────────────────────────────────────────────
+//  RECONCILIATION EVENTS
+// ─────────────────────────────────────────────────────────
+
+enum MismatchType {
+  MISMATCH_TYPE_UNSPECIFIED = 0;
+  MISMATCH_TYPE_CORRECT_PLACEMENT = 1;
+  MISMATCH_TYPE_MISPLACED = 2;
+  MISMATCH_TYPE_MISSING = 3;
+  MISMATCH_TYPE_DUPLICATE = 4;
+  MISMATCH_TYPE_UNKNOWN = 5;
+  MISMATCH_TYPE_QUANTITY_DISCREPANCY = 6;
+}
+
+message InventoryVerified {
+  string verification_id = 1;
+  string observation_id = 2;
+  string warehouse_id = 3;
+  string bin_id = 4;
+  string sku = 5;
+  google.protobuf.Timestamp verified_at = 6;
+  float confidence = 7;
+}
+
+message InventoryMismatchDetected {
+  string mismatch_id = 1;
+  string observation_id = 2;
+  string warehouse_id = 3;
+  string bin_id = 4;
+  google.protobuf.Timestamp detected_at = 5;
+
+  string expected_sku = 6;
+  int32 expected_quantity = 7;
+  string observed_sku = 8;
+  int32 observed_quantity = 9;
+
+  MismatchType mismatch_type = 10;
+  float confidence = 11;
+
+  // If MISPLACED: the bin where this item should be
+  string expected_bin_id = 12;
+  string expected_bin_code = 13;
+}
+
+// ─────────────────────────────────────────────────────────
+//  ALERT EVENTS
+// ─────────────────────────────────────────────────────────
+
+enum AlertSeverity {
+  ALERT_SEVERITY_UNSPECIFIED = 0;
+  ALERT_SEVERITY_INFO = 1;
+  ALERT_SEVERITY_LOW = 2;
+  ALERT_SEVERITY_MEDIUM = 3;
+  ALERT_SEVERITY_HIGH = 4;
+  ALERT_SEVERITY_CRITICAL = 5;
+}
+
+enum AlertStatus {
+  ALERT_STATUS_UNSPECIFIED = 0;
+  ALERT_STATUS_OPEN = 1;
+  ALERT_STATUS_ACKNOWLEDGED = 2;
+  ALERT_STATUS_ACTION_REQUIRED = 3;
+  ALERT_STATUS_RESOLVED = 4;
+  ALERT_STATUS_DISMISSED = 5;
+  ALERT_STATUS_FALSE_POSITIVE = 6;
+}
+
+message AlertCreated {
+  string alert_id = 1;
+  string warehouse_id = 2;
+  string bin_id = 3;
+  string sku = 4;
+  MismatchType alert_type = 5;
+  AlertSeverity severity = 6;
+  string title = 7;
+  string description = 8;
+  string expected_value = 9;
+  string observed_value = 10;
+  google.protobuf.Timestamp created_at = 11;
+}
+
+message AlertResolved {
+  string alert_id = 1;
+  string warehouse_id = 2;
+  string resolved_by_user_id = 3;
+  string resolution_notes = 4;
+  google.protobuf.Timestamp resolved_at = 5;
+}
+
+// ─────────────────────────────────────────────────────────
+//  DIGITAL TWIN EVENTS
+// ─────────────────────────────────────────────────────────
+
+message TwinRobotUpdate {
+  string robot_id = 1;
+  string warehouse_id = 2;
+  Position3D position = 3;
+  double battery_pct = 4;
+  RobotStatus status = 5;
+  google.protobuf.Timestamp timestamp = 6;
+}
+
+message TwinBinUpdate {
+  string bin_id = 1;
+  string warehouse_id = 2;
+  string current_sku = 3;
+  string bin_state = 4;  // VERIFIED, MISMATCH, MISSING, UNKNOWN, UNSCANNED
+  float confidence = 5;
+  google.protobuf.Timestamp last_scanned_at = 6;
+}
