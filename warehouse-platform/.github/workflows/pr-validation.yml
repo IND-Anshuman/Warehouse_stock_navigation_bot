@@ -1,0 +1,389 @@
+# ============================================================
+#  GitHub Actions — PR Validation Workflow
+#  Autonomous Warehouse Inventory Audit Platform
+# ============================================================
+#
+#  Triggers on every PR to main or develop.
+#  Runs lint/type-check, unit tests (parallel matrix), and
+#  Docker build checks. fail-fast: false so all jobs complete.
+# ============================================================
+
+name: PR Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: pr-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "20"
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}/warehouse-platform
+
+# ─────────────────────────────────────────────
+# JOB 1 — Lint & Type Check
+# ─────────────────────────────────────────────
+jobs:
+  lint-and-type-check:
+    name: "Lint & Type Check (${{ matrix.component }})"
+    runs-on: ubuntu-latest
+    fail-fast: false
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+          - topology-service
+          - mission-service
+          - observation-service
+          - reconciliation-service
+          - alerting-service
+          - digital-twin-sync
+          - ops-dashboard
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Python services ────────────────────────────────────
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        if: matrix.component != 'ops-dashboard'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip dependencies
+        if: matrix.component != 'ops-dashboard'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            services/${{ matrix.component }}/.venv
+          key: pip-${{ matrix.component }}-${{ hashFiles(format('services/{0}/requirements*.txt', matrix.component)) }}
+          restore-keys: |
+            pip-${{ matrix.component }}-
+
+      - name: Install Python linting tools
+        if: matrix.component != 'ops-dashboard'
+        working-directory: services/${{ matrix.component }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 mypy black isort
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+
+      - name: Run flake8
+        if: matrix.component != 'ops-dashboard'
+        working-directory: services/${{ matrix.component }}
+        run: |
+          flake8 . \
+            --max-line-length=120 \
+            --extend-ignore=E203,W503 \
+            --exclude=.venv,venv,__pycache__,.git,dist,build \
+            --format='::error file=%(path)s,line=%(row)d,col=%(col)d::%(text)s'
+
+      - name: Run black (format check)
+        if: matrix.component != 'ops-dashboard'
+        working-directory: services/${{ matrix.component }}
+        run: |
+          black --check --line-length 120 . \
+            --exclude '/(\.venv|venv|__pycache__|\.git|dist|build)/'
+
+      - name: Run isort (import order check)
+        if: matrix.component != 'ops-dashboard'
+        working-directory: services/${{ matrix.component }}
+        run: |
+          isort --check-only --profile black .
+
+      - name: Run mypy (type checking)
+        if: matrix.component != 'ops-dashboard'
+        working-directory: services/${{ matrix.component }}
+        run: |
+          mypy . \
+            --ignore-missing-imports \
+            --strict-optional \
+            --warn-return-any \
+            --no-error-summary \
+            --exclude '(venv|\.venv|__pycache__|dist|build)'
+
+      # ── Frontend (ops-dashboard) ────────────────────────────
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        if: matrix.component == 'ops-dashboard'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: apps/ops-dashboard/package-lock.json
+
+      - name: Install frontend dependencies
+        if: matrix.component == 'ops-dashboard'
+        working-directory: apps/ops-dashboard
+        run: npm ci
+
+      - name: Run ESLint
+        if: matrix.component == 'ops-dashboard'
+        working-directory: apps/ops-dashboard
+        run: |
+          npx eslint . \
+            --ext .ts,.tsx \
+            --format @microsoft/eslint-formatter-sarif \
+            --output-file eslint-results.sarif \
+            || npx eslint . --ext .ts,.tsx
+
+      - name: Upload ESLint SARIF
+        if: matrix.component == 'ops-dashboard' && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: apps/ops-dashboard/eslint-results.sarif
+          category: eslint
+        continue-on-error: true
+
+      - name: Run TypeScript type check
+        if: matrix.component == 'ops-dashboard'
+        working-directory: apps/ops-dashboard
+        run: npx tsc --noEmit --pretty
+
+  # ─────────────────────────────────────────────
+  # JOB 2 — Unit Tests (parallel matrix)
+  # ─────────────────────────────────────────────
+  unit-tests:
+    name: "Unit Tests (${{ matrix.service }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: []  # Run in parallel with lint
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - topology-service
+          - mission-service
+          - observation-service
+          - reconciliation-service
+          - alerting-service
+          - digital-twin-sync
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_warehouse
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            services/${{ matrix.service }}/.venv
+          key: pip-test-${{ matrix.service }}-${{ hashFiles(format('services/{0}/requirements*.txt', matrix.service)) }}
+          restore-keys: |
+            pip-test-${{ matrix.service }}-
+            pip-${{ matrix.service }}-
+
+      - name: Install dependencies
+        working-directory: services/${{ matrix.service }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio pytest-cov pytest-xdist httpx
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+
+      - name: Run pytest
+        working-directory: services/${{ matrix.service }}
+        env:
+          DATABASE_URL: postgresql+asyncpg://test_user:test_password@localhost:5432/test_warehouse
+          REDIS_URL: redis://localhost:6379/0
+          KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+          ENVIRONMENT: test
+          LOG_LEVEL: WARNING
+        run: |
+          pytest tests/ \
+            -v \
+            --tb=short \
+            --cov=. \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --cov-fail-under=70 \
+            -n auto \
+            --junitxml=junit-${{ matrix.service }}.xml \
+            -p no:warnings
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.service }}
+          path: |
+            services/${{ matrix.service }}/junit-${{ matrix.service }}.xml
+            services/${{ matrix.service }}/coverage.xml
+          retention-days: 7
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          file: services/${{ matrix.service }}/coverage.xml
+          flags: ${{ matrix.service }}
+          name: ${{ matrix.service }}-coverage
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # ─────────────────────────────────────────────
+  # JOB 3 — Docker Build Check
+  # ─────────────────────────────────────────────
+  build-check:
+    name: "Docker Build (${{ matrix.service }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: []  # Run in parallel
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: topology-service
+            context: ./services/topology-service
+            dockerfile: ./services/topology-service/Dockerfile
+          - service: mission-service
+            context: ./services/mission-service
+            dockerfile: ./services/mission-service/Dockerfile
+          - service: observation-service
+            context: ./services/observation-service
+            dockerfile: ./services/observation-service/Dockerfile
+          - service: reconciliation-service
+            context: ./services/reconciliation-service
+            dockerfile: ./services/reconciliation-service/Dockerfile
+          - service: alerting-service
+            context: ./services/alerting-service
+            dockerfile: ./services/alerting-service/Dockerfile
+          - service: digital-twin-sync
+            context: ./services/digital-twin-sync
+            dockerfile: ./services/digital-twin-sync/Dockerfile
+          - service: robot-simulator
+            context: ./apps/robot-simulator
+            dockerfile: ./apps/robot-simulator/Dockerfile
+          - service: ops-dashboard
+            context: ./apps/ops-dashboard
+            dockerfile: ./apps/ops-dashboard/Dockerfile
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache-${{ matrix.service }}
+          key: buildx-${{ matrix.service }}-${{ github.sha }}
+          restore-keys: |
+            buildx-${{ matrix.service }}-
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: false
+          tags: ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:pr-${{ github.event.pull_request.number }}
+          cache-from: type=local,src=/tmp/.buildx-cache-${{ matrix.service }}
+          cache-to: type=local,dest=/tmp/.buildx-cache-${{ matrix.service }}-new,mode=max
+          platforms: linux/amd64
+          build-args: |
+            BUILD_DATE=${{ github.event.pull_request.updated_at }}
+            VCS_REF=${{ github.sha }}
+            VERSION=pr-${{ github.event.pull_request.number }}
+
+      - name: Rotate cache
+        run: |
+          rm -rf /tmp/.buildx-cache-${{ matrix.service }}
+          mv /tmp/.buildx-cache-${{ matrix.service }}-new /tmp/.buildx-cache-${{ matrix.service }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:pr-${{ github.event.pull_request.number }}
+          format: "sarif"
+          output: "trivy-${{ matrix.service }}.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"
+        continue-on-error: true
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category: trivy-${{ matrix.service }}
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────
+  # JOB 4 — PR Summary Gate
+  # ─────────────────────────────────────────────
+  pr-gate:
+    name: "PR Gate — All Checks Passed"
+    runs-on: ubuntu-latest
+    needs: [lint-and-type-check, unit-tests, build-check]
+    if: always()
+
+    steps:
+      - name: Check all jobs succeeded
+        run: |
+          if [[ "${{ needs.lint-and-type-check.result }}" != "success" ]]; then
+            echo "❌ lint-and-type-check failed"
+            exit 1
+          fi
+          if [[ "${{ needs.unit-tests.result }}" != "success" ]]; then
+            echo "❌ unit-tests failed"
+            exit 1
+          fi
+          if [[ "${{ needs.build-check.result }}" != "success" ]]; then
+            echo "❌ build-check failed"
+            exit 1
+          fi
+          echo "✅ All PR validation checks passed!"
