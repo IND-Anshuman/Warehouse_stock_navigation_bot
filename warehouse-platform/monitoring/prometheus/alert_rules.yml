@@ -1,0 +1,424 @@
+# ============================================================
+#  Autonomous Warehouse Inventory Audit Platform
+#  Prometheus Alert Rules
+# ============================================================
+
+groups:
+
+  # ─────────────────────────────────────────────
+  # SERVICE HEALTH
+  # ─────────────────────────────────────────────
+  - name: service_health
+    interval: 15s
+    rules:
+
+      - alert: ServiceDown
+        expr: |
+          up{job=~"topology-service|mission-service|observation-service|reconciliation-service|alerting-service|digital-twin-sync"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+          runbook: "https://wiki.internal/runbooks/service-down"
+        annotations:
+          summary: "Service {{ $labels.job }} is DOWN"
+          description: |
+            Service {{ $labels.job }} on instance {{ $labels.instance }} has been unreachable for more than 1 minute.
+            Prometheus cannot scrape its /metrics endpoint (up == 0).
+          impact: "Dependent workflows are degraded. Investigate immediately."
+          dashboard: "http://grafana:3000/d/warehouse-overview"
+
+      - alert: ServiceHealthCheckFailing
+        expr: |
+          probe_success{job=~"topology-service|mission-service|observation-service|reconciliation-service|alerting-service|digital-twin-sync"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+          runbook: "https://wiki.internal/runbooks/health-check-failing"
+        annotations:
+          summary: "Health check failing for {{ $labels.job }}"
+          description: |
+            The /health endpoint of {{ $labels.job }} is returning non-200 responses for more than 2 minutes.
+            This indicates the service is running but unhealthy (database, cache, or downstream dependency issues).
+
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum by (job) (
+              rate(http_requests_total{status=~"5.."}[5m])
+            )
+            /
+            sum by (job) (
+              rate(http_requests_total[5m])
+            )
+          ) > 0.05
+        for: 3m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "High HTTP 5xx error rate on {{ $labels.job }}"
+          description: |
+            Service {{ $labels.job }} is returning 5xx errors at a rate of {{ $value | humanizePercentage }},
+            which exceeds the 5% threshold for more than 3 minutes.
+
+  # ─────────────────────────────────────────────
+  # KAFKA / INGESTION
+  # ─────────────────────────────────────────────
+  - name: kafka_ingestion
+    interval: 30s
+    rules:
+
+      - alert: IngestionBacklogHigh
+        expr: |
+          kafka_consumer_group_lag{topic=~"observation.raw|inventory.reconciliation.*|robot.telemetry.*"} > 5000
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+          runbook: "https://wiki.internal/runbooks/kafka-lag"
+        annotations:
+          summary: "Kafka consumer lag critical on topic {{ $labels.topic }}"
+          description: |
+            Consumer group {{ $labels.consumergroup }} has a lag of {{ $value | humanize }} messages
+            on topic {{ $labels.topic }} (partition {{ $labels.partition }}).
+            This indicates consumers are falling behind production, risking data loss or processing delays.
+          threshold: "5000 messages"
+          duration: "5 minutes"
+
+      - alert: KafkaConsumerLagWarning
+        expr: |
+          kafka_consumer_group_lag{topic=~"observation.raw|inventory.reconciliation.*|robot.telemetry.*"} > 1000
+        for: 3m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Kafka consumer lag elevated on topic {{ $labels.topic }}"
+          description: |
+            Consumer group {{ $labels.consumergroup }} has a lag of {{ $value | humanize }} messages
+            on topic {{ $labels.topic }}. Monitor for further increase.
+
+      - alert: KafkaBrokerDown
+        expr: |
+          kafka_brokers < 1
+        for: 2m
+        labels:
+          severity: critical
+          team: infrastructure
+        annotations:
+          summary: "Kafka broker count dropped to {{ $value }}"
+          description: |
+            The number of active Kafka brokers is {{ $value }}, which is below the minimum required.
+            All message production and consumption will be halted.
+
+      - alert: KafkaTopicUnderReplicated
+        expr: |
+          kafka_topic_partition_under_replicated_partition > 0
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Kafka topic {{ $labels.topic }} has under-replicated partitions"
+          description: |
+            Topic {{ $labels.topic }} has {{ $value }} under-replicated partitions.
+            This reduces fault tolerance and risks data loss.
+
+  # ─────────────────────────────────────────────
+  # ROBOT FLEET
+  # ─────────────────────────────────────────────
+  - name: robot_fleet
+    interval: 15s
+    rules:
+
+      - alert: RobotHeartbeatLost
+        expr: |
+          (time() - warehouse_robot_last_heartbeat_timestamp_seconds) > 30
+        for: 0m
+        labels:
+          severity: warning
+          team: robotics
+          runbook: "https://wiki.internal/runbooks/robot-heartbeat"
+        annotations:
+          summary: "Robot {{ $labels.robot_id }} heartbeat lost"
+          description: |
+            Robot {{ $labels.robot_id }} in warehouse {{ $labels.warehouse_id }} has not sent a heartbeat
+            for {{ $value | humanizeDuration }}. The robot may be stuck, offline, or experiencing a
+            communication failure.
+          last_seen: "{{ $value | humanizeDuration }} ago"
+
+      - alert: RobotFleetSizeCritical
+        expr: |
+          count(warehouse_robot_last_heartbeat_timestamp_seconds > (time() - 60)) < 1
+        for: 2m
+        labels:
+          severity: critical
+          team: robotics
+        annotations:
+          summary: "No active robots in the warehouse fleet"
+          description: |
+            Zero robots have sent heartbeats in the last 60 seconds. Audit missions cannot be executed.
+
+      - alert: RobotBatteryLow
+        expr: |
+          warehouse_robot_battery_percent < 15
+        for: 0m
+        labels:
+          severity: warning
+          team: robotics
+        annotations:
+          summary: "Robot {{ $labels.robot_id }} battery critically low ({{ $value }}%)"
+          description: |
+            Robot {{ $labels.robot_id }} has {{ $value }}% battery remaining.
+            It should return to the charging station immediately.
+
+  # ─────────────────────────────────────────────
+  # INVENTORY RECONCILIATION
+  # ─────────────────────────────────────────────
+  - name: inventory_reconciliation
+    interval: 30s
+    rules:
+
+      - alert: HighMismatchRate
+        expr: |
+          sum(rate(warehouse_inventory_mismatches_total[1m])) * 60 > 100
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+          runbook: "https://wiki.internal/runbooks/mismatch-rate"
+        annotations:
+          summary: "Inventory mismatch rate exceeds 100 events/min"
+          description: |
+            The rate of inventory reconciliation mismatch events is {{ $value | humanize }} per minute,
+            which exceeds the warning threshold of 100/min for more than 5 minutes.
+            This may indicate systematic scanning errors, SKU database inconsistencies, or robot
+            misidentification of products.
+          threshold: "100 mismatches/minute"
+          duration: "5 minutes"
+
+      - alert: InventoryAccuracyDegraded
+        expr: |
+          (
+            1 - (
+              sum(rate(warehouse_inventory_mismatches_total[10m]))
+              /
+              sum(rate(warehouse_observations_processed_total[10m]))
+            )
+          ) * 100 < 95
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Inventory accuracy fallen below 95%"
+          description: |
+            Inventory accuracy is currently {{ $value | humanize }}%, which is below the 95% threshold.
+            Immediate audit review recommended.
+
+      - alert: ReconciliationQueueStalled
+        expr: |
+          rate(warehouse_reconciliation_processed_total[5m]) == 0
+            and
+          warehouse_reconciliation_queue_depth > 0
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Reconciliation processing has stalled with {{ $value }} items queued"
+          description: |
+            The reconciliation service has stopped processing items despite having a non-empty queue.
+            Check for consumer group failures or service crashes.
+
+  # ─────────────────────────────────────────────
+  # DATABASE
+  # ─────────────────────────────────────────────
+  - name: database
+    interval: 30s
+    rules:
+
+      - alert: DatabaseConnectionPoolExhausted
+        expr: |
+          warehouse_db_pool_wait_duration_seconds > 5
+        for: 0m
+        labels:
+          severity: critical
+          team: platform
+          runbook: "https://wiki.internal/runbooks/db-pool-exhausted"
+        annotations:
+          summary: "DB connection pool wait time {{ $value | humanizeDuration }} on {{ $labels.service }}"
+          description: |
+            Service {{ $labels.service }} is waiting {{ $value | humanizeDuration }} for a database connection.
+            The connection pool is exhausted. This will cause request timeouts and service degradation.
+            Consider increasing pool size or investigating connection leaks.
+          threshold: "5 seconds wait time"
+
+      - alert: DatabaseConnectionsNearLimit
+        expr: |
+          (
+            pg_stat_database_numbackends
+            /
+            pg_settings_max_connections
+          ) > 0.80
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "PostgreSQL connections at {{ $value | humanizePercentage }} of max"
+          description: |
+            PostgreSQL has {{ $value | humanizePercentage }} of its maximum connections in use.
+            At 100%, new connections will be refused.
+
+      - alert: DatabaseReplicationLag
+        expr: |
+          pg_replication_lag > 30
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "PostgreSQL replication lag is {{ $value | humanizeDuration }}"
+          description: |
+            Database replication is lagging by {{ $value | humanizeDuration }}.
+            Read replicas may be serving stale data.
+
+  # ─────────────────────────────────────────────
+  # ALERTING SERVICE
+  # ─────────────────────────────────────────────
+  - name: alerting_service
+    interval: 30s
+    rules:
+
+      - alert: AlertOpenCountHigh
+        expr: |
+          warehouse_alerts_open_total{severity="critical"} > 10
+        for: 0m
+        labels:
+          severity: high
+          team: platform
+          runbook: "https://wiki.internal/runbooks/high-alert-count"
+        annotations:
+          summary: "{{ $value }} open critical alerts in the system"
+          description: |
+            There are currently {{ $value }} open critical-severity alerts in the alerting service.
+            This indicates a widespread platform issue. The on-call team should triage immediately.
+          threshold: "10 open critical alerts"
+
+      - alert: AlertingServiceBacklogHigh
+        expr: |
+          warehouse_alert_processing_queue_depth > 500
+        for: 3m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Alert processing queue depth is {{ $value }}"
+          description: |
+            The alerting service queue has {{ $value }} unprocessed alerts. Notifications may be delayed.
+
+  # ─────────────────────────────────────────────
+  # LATENCY / SLOs
+  # ─────────────────────────────────────────────
+  - name: latency_slos
+    interval: 15s
+    rules:
+
+      - alert: ObservationProcessingLatencyHigh
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, job) (
+              rate(http_request_duration_seconds_bucket{job="observation-service"}[5m])
+            )
+          ) > 2.0
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+          runbook: "https://wiki.internal/runbooks/observation-latency"
+        annotations:
+          summary: "Observation service p99 latency is {{ $value | humanizeDuration }}"
+          description: |
+            The 99th percentile request duration for the observation-service has exceeded 2 seconds
+            for the past 5 minutes. Current p99: {{ $value | humanizeDuration }}.
+            This may indicate database pressure, slow image processing, or resource contention.
+          slo: "p99 < 2s"
+          threshold: "2 seconds"
+
+      - alert: MissionServiceLatencyHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, job) (
+              rate(http_request_duration_seconds_bucket{job="mission-service"}[5m])
+            )
+          ) > 1.0
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Mission service p95 latency is {{ $value | humanizeDuration }}"
+          description: |
+            The 95th percentile request duration for mission-service exceeds 1 second.
+            Current p95: {{ $value | humanizeDuration }}.
+
+      - alert: APIGatewayHighLatency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(http_request_duration_seconds_bucket[5m])
+            )
+          ) > 3.0
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Platform-wide p95 latency is {{ $value | humanizeDuration }}"
+          description: |
+            Aggregated p95 HTTP latency across all services exceeds 3 seconds.
+
+  # ─────────────────────────────────────────────
+  # RESOURCE UTILIZATION
+  # ─────────────────────────────────────────────
+  - name: resource_utilization
+    interval: 60s
+    rules:
+
+      - alert: ContainerHighCPU
+        expr: |
+          (
+            rate(container_cpu_usage_seconds_total{container!=""}[5m]) * 100
+          ) > 85
+        for: 10m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Container {{ $labels.container }} CPU usage at {{ $value | humanize }}%"
+          description: |
+            Container {{ $labels.container }} in pod {{ $labels.pod }} has been using more than
+            85% CPU for 10 minutes. Consider horizontal scaling.
+
+      - alert: ContainerHighMemory
+        expr: |
+          (
+            container_memory_usage_bytes{container!=""}
+            /
+            container_spec_memory_limit_bytes{container!=""}
+          ) > 0.90
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Container {{ $labels.container }} memory at {{ $value | humanizePercentage }}"
+          description: |
+            Container {{ $labels.container }} is using {{ $value | humanizePercentage }} of its
+            memory limit. OOM kill risk is elevated.

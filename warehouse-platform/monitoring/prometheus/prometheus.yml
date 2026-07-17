@@ -1,0 +1,175 @@
+# ============================================================
+#  Autonomous Warehouse Inventory Audit Platform
+#  Prometheus Configuration
+# ============================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    environment: "local"
+    platform: "warehouse-audit"
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+          # Uncomment when Alertmanager is deployed:
+          # - alertmanager:9093
+
+# Load alert rule files
+rule_files:
+  - "alert_rules.yml"
+
+# ─────────────────────────────────────────────
+# SCRAPE CONFIGURATIONS
+# ─────────────────────────────────────────────
+
+scrape_configs:
+
+  # Prometheus self-monitoring
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+    metrics_path: /metrics
+    scrape_interval: 30s
+
+  # ── Application Services ─────────────────────
+
+  - job_name: "topology-service"
+    static_configs:
+      - targets: ["topology-service:8001"]
+        labels:
+          service: "topology-service"
+          team: "platform"
+          tier: "application"
+    metrics_path: /metrics
+    scrape_interval: 15s
+    honor_labels: false
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: job
+        replacement: "topology-service"
+
+  - job_name: "mission-service"
+    static_configs:
+      - targets: ["mission-service:8002"]
+        labels:
+          service: "mission-service"
+          team: "platform"
+          tier: "application"
+    metrics_path: /metrics
+    scrape_interval: 15s
+    honor_labels: false
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: job
+        replacement: "mission-service"
+
+  - job_name: "observation-service"
+    static_configs:
+      - targets: ["observation-service:8003"]
+        labels:
+          service: "observation-service"
+          team: "platform"
+          tier: "application"
+    metrics_path: /metrics
+    scrape_interval: 15s
+    honor_labels: false
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: job
+        replacement: "observation-service"
+
+  - job_name: "reconciliation-service"
+    static_configs:
+      - targets: ["reconciliation-service:8004"]
+        labels:
+          service: "reconciliation-service"
+          team: "platform"
+          tier: "application"
+    metrics_path: /metrics
+    scrape_interval: 15s
+    honor_labels: false
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: job
+        replacement: "reconciliation-service"
+
+  - job_name: "alerting-service"
+    static_configs:
+      - targets: ["alerting-service:8005"]
+        labels:
+          service: "alerting-service"
+          team: "platform"
+          tier: "application"
+    metrics_path: /metrics
+    scrape_interval: 15s
+    honor_labels: false
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: job
+        replacement: "alerting-service"
+
+  - job_name: "digital-twin-sync"
+    static_configs:
+      - targets: ["digital-twin-sync:8006"]
+        labels:
+          service: "digital-twin-sync"
+          team: "platform"
+          tier: "application"
+    metrics_path: /metrics
+    scrape_interval: 15s
+    honor_labels: false
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: job
+        replacement: "digital-twin-sync"
+
+  # ── Infrastructure Services ───────────────────
+
+  - job_name: "postgres-exporter"
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+        labels:
+          service: "postgres"
+          tier: "infrastructure"
+    metrics_path: /metrics
+    scrape_interval: 30s
+
+  - job_name: "redis-exporter"
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+        labels:
+          service: "redis"
+          tier: "infrastructure"
+    metrics_path: /metrics
+    scrape_interval: 30s
+
+  - job_name: "kafka-jmx"
+    static_configs:
+      - targets: ["kafka:9101"]
+        labels:
+          service: "kafka"
+          tier: "infrastructure"
+    metrics_path: /metrics
+    scrape_interval: 30s
+
+  # ── Grafana Self-monitoring ───────────────────
+
+  - job_name: "grafana"
+    static_configs:
+      - targets: ["grafana:3000"]
+        labels:
+          service: "grafana"
+          tier: "observability"
+    metrics_path: /metrics
+    scrape_interval: 60s
